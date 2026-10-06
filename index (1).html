@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>The Meter – Usage Billing Engine</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f6f7f9;--card:#fff;--tx:#1b1f24;--mu:#667;--ac:#2f6fed;--bd:#dde1e7;--ok:#16863a;--bad:#c62828}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14161a;--card:#1d2026;--tx:#e8eaed;--mu:#9aa;--ac:#6b9bff;--bd:#323741;--ok:#4cc46e;--bad:#ff6b6b}}
+:root[data-theme="dark"]{--bg:#14161a;--card:#1d2026;--tx:#e8eaed;--mu:#9aa;--ac:#6b9bff;--bd:#323741;--ok:#4cc46e;--bad:#ff6b6b}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,Segoe UI,Arial,sans-serif;padding:12px;max-width:900px;margin-inline:auto}
+h1{font-size:20px;margin:4px 0 10px}.bar,.tabs{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:10px}
+label{display:block;font-size:12px;color:var(--mu);margin:8px 0 2px}
+input,select,textarea,button{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;max-width:100%}
+textarea{width:100%;min-height:80px;font-family:Consolas,monospace}
+button{cursor:pointer;background:var(--ac);color:#fff;border:0;padding:7px 12px}button.t{background:var(--card);color:var(--tx);border:1px solid var(--bd)}button.t.on{background:var(--ac);color:#fff}
+pre{overflow-x:auto;background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:10px;margin:8px 0 0;white-space:pre-wrap;font-size:13px}
+#log{height:120px;overflow:auto;background:#111;color:#7cfc9a;font-size:12px}.p{color:var(--ok)}.f{color:var(--bad)}.row{display:flex;gap:10px;flex-wrap:wrap}.row>div{flex:1;min-width:150px}
+</style></head><body>
+<h1>The Meter · usage-based billing (₹ per 1,000 tokens)</h1>
+<div class="bar">Acting as role:
+<select id="role"></select>
+<label style="display:inline;margin:0"><input type="checkbox" id="out"> Simulate broker outage</label></div>
+<div class="tabs" id="tabs"></div>
+
+<div class="card tab"><b>Setup</b>
+<div class="row"><div><label>Customer name</label><input id="cn" value="Acme AI"> <button onclick="go(addC)">Add customer</button></div></div>
+<div class="row"><div><label>Plan name</label><input id="pn" value="Starter"></div><div><label>Base fee ₹/month</label><input id="pb" value="1000" size="8"></div>
+<div><label>Tier mode</label><select id="pm"><option>graduated</option><option>volume</option></select></div></div>
+<label>Tiers per line: up_to_k_tokens, ₹ per 1,000 tokens, flat fee ("-" = unlimited)</label>
+<textarea id="pt">100,10,0
+500,8,0
+-,5,0</textarea><button onclick="go(addP)">Add plan</button></div>
+
+<div class="card tab"><b>Subscribe / Upgrade</b>
+<div class="row"><div><label>Customer</label><select id="sc"></select></div><div><label>Plan</label><select id="sp"></select></div></div>
+<div class="row"><div><label>Start date</label><input id="sd" value="2026-03-01"></div><div><label>Idempotency key (optional)</label><input id="ik"></div></div>
+<button onclick="go(sub)" style="margin-top:8px">Subscribe</button><hr>
+<div class="row"><div><label>Upgrade to plan</label><select id="up"></select></div><div><label>Upgrade at</label><input id="ua" value="2026-03-15"></div></div>
+<button onclick="go(upg)" style="margin-top:8px">Upgrade now (prorate)</button></div>
+
+<div class="card tab"><b>Usage events</b>
+<div class="row"><div><label>Customer</label><select id="ec"></select></div><div><label>Event ID</label><input id="ei"></div>
+<div><label>Tokens</label><input id="et" value="50000" size="8"></div><div><label>Timestamp</label><input id="es" value="2026-03-05 10:00"></div></div>
+<button onclick="go(send)" style="margin-top:8px">Send event (click twice = duplicate)</button>
+<button class="t" onclick="newId()">New event ID</button> <button class="t" onclick="go(tot)">Total tokens</button></div>
+
+<div class="card tab"><b>Invoices</b>
+<label>Customer</label><select id="ic"></select>
+<button onclick="go(gen)">Generate usage invoice</button> <button class="t" onclick="go(hist)">History</button><pre id="inv">No invoice yet.</pre></div>
+
+<div class="card tab"><b>Killer tests</b> <button onclick="runT()">Run all tests</button><pre id="tr"></pre></div>
+<pre id="log"></pre>
+
+<script>
+const ROLES={super_admin:{"*":["read","write"]},all_reader:{"*":["read"]},all_writer:{"*":["read","write"]},event_ingestor:{event:["write"]},event_reader:{event:["read"]}};
+const r2=x=>(Math.round(x*100+(x<0?-1e-9:1e-9))/100);
+const pd=s=>{s=String(s).trim().replace(" ","T");if(!/T/.test(s))s+="T00:00";return new Date(s+(/Z|[+-]\d\d:?\d\d$/.test(s)?"":"Z"))};
+const addMonth=d=>{const x=new Date(d),day=x.getUTCDate();x.setUTCDate(1);x.setUTCMonth(x.getUTCMonth()+1);const dim=new Date(Date.UTC(x.getUTCFullYear(),x.getUTCMonth()+1,0)).getUTCDate();x.setUTCDate(Math.min(day,dim));return x};
+const uid=p=>p+"_"+Math.random().toString(36).slice(2,8);
+
+function priceTiers(tiers,mode,u){let lines=[];if(u<=0)return[0,lines];
+ if(mode=="volume"){for(const[up,unit,flat]of tiers)if(up==null||u<=up){const a=u*unit+flat;return[a,[[`${u} k-tokens @ ₹${unit} (volume) + flat ₹${flat}`,a]]]}}
+ let lo=0;for(const[up,unit,flat]of tiers){if(u<=lo)break;const top=up==null?u:Math.min(u,up),qty=top-lo,a=qty*unit+flat;lines.push([`${qty} k-tokens @ ₹${unit} (slab) + flat ₹${flat}`,a]);if(up==null)break;lo=up}
+ return[lines.reduce((s,l)=>s+l[1],0),lines]}
+
+function Eng(){const S={c:[],p:[],s:[],e:{},i:[]};let broker=true;
+ const need=(r,e,a)=>{const p=ROLES[r]||{};if(!((p["*"]||[]).includes(a)||(p[e]||[]).includes(a)))throw new Error(`403 Forbidden – role '${r}' lacks ${e}.${a}`)};
+ const plan=id=>{const p=S.p.find(x=>x.id==id);if(!p)throw new Error("Unknown plan");return p};
+ const save=inv=>{inv.id=uid("inv");inv.total=r2(inv.total);S.i.push(inv);return inv};
+ return{S,setBroker:v=>broker=v,
+ addC(r,n){need(r,"customer","write");if(!n.trim())throw new Error("Name required");const c={id:uid("cust"),name:n.trim()};S.c.push(c);return c.id},
+ customers(r){need(r,"customer","read");return S.c},plans(r){need(r,"plan","read");return S.p},
+ addP(r,name,base,mode,tiers){need(r,"plan","write");if(!tiers.length||tiers.at(-1)[0]!=null)throw new Error("Last tier must be unlimited ('-')");const p={id:uid("plan"),name,base:+base,mode,tiers};S.p.push(p);return p.id},
+ sub(r,c,p,start,idem){need(r,"subscription","write");plan(p);const st=pd(start);
+  if(idem){const x=S.s.find(s=>s.idem==idem);if(x)return x.id}
+  if(S.s.some(s=>s.c==c&&s.status=="active"))throw new Error("409 Conflict – customer already has an active subscription (use upgrade)");
+  const end=addMonth(st),s={id:uid("sub"),c,p,status:"active",ps:st,pe:end,ss:st,se:end,idem:idem||null};S.s.push(s);return s.id},
+ upg(r,c,np,at){need(r,"subscription","write");at=pd(at);const o=S.s.find(s=>s.c==c&&s.status=="active");if(!o)throw new Error("No active subscription");
+  if(o.p==np)throw new Error("409 Conflict – already on that plan");if(!(at>=o.ss&&at<o.pe))throw new Error("Upgrade time must be inside current period");
+  const rem=(o.pe-at)/(o.pe-o.ps),op=plan(o.p),n=plan(np),cr=-r2(op.base*rem),ch=r2(n.base*rem);
+  o.status="ended";o.se=at;S.s.push({id:uid("sub"),c,p:np,status:"active",ps:o.ps,pe:o.pe,ss:at,se:o.pe,idem:null});
+  return save({kind:"PRORATION",c,lines:[[`Credit unused '${op.name}' (${rem.toFixed(6)} of period)`,cr],[`Charge '${n.name}' for remaining ${rem.toFixed(6)}`,ch]],total:cr+ch})},
+ ingest(r,id,c,tok,ts){need(r,"event","write");if(!broker)throw new Error("503 Service Unavailable – broker down, Retry-After: 5s");
+  if(!String(id).trim())throw new Error("event_id required");if(!(tok>=0))throw new Error("tokens must be >= 0");
+  if(S.e[id])return"duplicate (ignored)";S.e[id]={c,tok:+tok,ts:pd(ts)};return"accepted"},
+ total(r,c){need(r,"event","read");return Object.values(S.e).filter(e=>e.c==c).reduce((s,e)=>s+e.tok,0)},
+ gen(r,c){need(r,"invoice","write");const subs=S.s.filter(s=>s.c==c);if(!subs.length)throw new Error("No subscription");let lines=[],tot=0;
+  for(const s of subs){const t=Object.values(S.e).filter(e=>e.c==c&&e.ts>=s.ss&&e.ts<s.se).reduce((a,e)=>a+e.tok,0);if(!t)continue;
+   const p=plan(s.p),[a,ls]=priceTiers(p.tiers,p.mode,t/1000);lines.push([`[${p.name}] ${t} tokens ${s.ss.toISOString().slice(0,10)}..${s.se.toISOString().slice(0,10)}`,r2(a)]);ls.forEach(l=>lines.push(["    "+l[0],r2(l[1])]));tot+=a}
+  return save({kind:"USAGE",c,lines,total:tot})},
+ hist(r,c){need(r,"invoice","read");return S.i.filter(i=>i.c==c)}}}
+
+const fmt=i=>`${i.kind} INVOICE ${i.id}  customer ${i.c}\n`+"-".repeat(64)+"\n"+i.lines.map(l=>l[0].padEnd(52)+l[1].toFixed(2).padStart(12)).join("\n")+"\n"+"-".repeat(64)+`\n${"TOTAL (INR)".padEnd(52)}${i.total.toFixed(2).padStart(12)}`;
+const E=Eng(),$=id=>document.getElementById(id),R=()=>$("role").value;
+const log=m=>{$("log").textContent+=`[${new Date().toLocaleTimeString()}] ${m}\n`;$("log").scrollTop=1e9};
+function go(f){try{f()}catch(e){log(e.message);alert(e.message)}refresh()}
+function refresh(){let cs=[],ps=[];try{cs=E.customers(R())}catch{}try{ps=E.plans(R())}catch{}
+ for(const id of["sc","ec","ic"]){const v=$(id).value;$(id).innerHTML=cs.map(c=>`<option value="${c.id}">${c.name} (${c.id})</option>`).join("");if(v)$(id).value=v}
+ for(const id of["sp","up"]){const v=$(id).value;$(id).innerHTML=ps.map(p=>`<option value="${p.id}">${p.name} (₹${p.base})</option>`).join("");if(v)$(id).value=v}}
+const addC=()=>log("Customer "+E.addC(R(),$("cn").value));
+const addP=()=>{const t=$("pt").value.trim().split("\n").map(l=>{const[u,p,f]=l.split(",").map(x=>x.trim());return[u=="-"?null:+u,+p,+f]});log("Plan "+E.addP(R(),$("pn").value,$("pb").value,$("pm").value,t))};
+const sub=()=>log("Subscription "+E.sub(R(),$("sc").value,$("sp").value,$("sd").value,$("ik").value));
+const upg=()=>{const i=E.upg(R(),$("sc").value,$("up").value,$("ua").value);$("inv").textContent=fmt(i);show(3);log("Upgrade prorated: net ₹"+i.total.toFixed(2))};
+const newId=()=>$("ei").value="evt-"+Math.random().toString(36).slice(2,8);
+const send=()=>log(`Event ${$("ei").value} → `+E.ingest(R(),$("ei").value,$("ec").value,$("et").value,$("es").value));
+const tot=()=>log("Total tokens: "+E.total(R(),$("ec").value));
+const gen=()=>{const i=E.gen(R(),$("ic").value);$("inv").textContent=fmt(i);log("Usage invoice ₹"+i.total.toFixed(2))};
+const hist=()=>{$("inv").textContent=E.hist(R(),$("ic").value).map(fmt).join("\n\n")||"No invoices."};
+$("out").onchange=()=>{E.setBroker(!$("out").checked);log("Broker "+($("out").checked?"DOWN (simulated)":"UP"))};
+$("role").innerHTML=Object.keys(ROLES).map(r=>`<option>${r}</option>`).join("");$("role").onchange=refresh;
+
+function runT(){const A="super_admin",out=[];
+ const t=(n,f)=>{let ok,d;try{[ok,d]=f()}catch(e){ok=false;d=e.message}out.push(`<span class="${ok?"p":"f"}">${ok?"PASS":"FAIL"}</span>  ${n}\n        ${d}`)};
+ const mk=()=>{const e=Eng(),c=e.addC(A,"Acme"),s=e.addP(A,"Starter",1000,"graduated",[[null,10,0]]),b=e.addP(A,"Pro",3000,"graduated",[[null,8,0]]);return[e,c,s,b]};
+ const throws=f=>{try{f();return null}catch(e){return e.message}};
+ t("KILLER 1  duplicate event counted once",()=>{const[e,c,s]=mk();e.sub(A,c,s,"2026-03-01");const a=e.ingest("event_ingestor","evt-1",c,1000,"2026-03-02"),b=e.ingest("event_ingestor","evt-1",c,1000,"2026-03-02"),n=e.total(A,c);return[n==1000&&b.startsWith("dup"),`${a} / ${b}; total tokens=${n}`]});
+ t("KILLER 2  mid-month upgrade proration",()=>{const[e,c,s,b]=mk();e.sub(A,c,s,"2026-03-01");const i=e.upg(A,c,b,"2026-03-15");return[i.lines[0][1]==-548.39&&i.lines[1][1]==1645.16&&i.total==1096.77,`${i.lines[0][1]} + ${i.lines[1][1]} = ${i.total} (hand: 2000×17/31 = 1096.77)`]});
+ t("KILLER 3  tiered pricing equals hand calc",()=>{const g=[[100,10,0],[500,8,0],[null,5,0]],a=priceTiers(g,"graduated",250)[0],v=priceTiers(g,"volume",250)[0],f=priceTiers([[100,10,0],[null,8,50]],"graduated",250)[0];return[a==2200&&v==2000&&f==2250,`graduated=${a} (100×10+150×8) volume=${v} (250×8) with flat=${f}`]});
+ t("IMPROVEMENT 1  broker down → 503, nothing stored",()=>{const[e,c]=mk();e.setBroker(false);const m=throws(()=>e.ingest(A,"x",c,5,"2026-03-02"));return[!!m&&m.startsWith("503")&&e.total(A,c)==0,m]});
+ t("IMPROVEMENT 2a idempotent subscription",()=>{const[e,c,s]=mk(),a=e.sub(A,c,s,"2026-03-01","k1"),b=e.sub(A,c,s,"2026-03-01","k1"),m=throws(()=>e.sub(A,c,s,"2026-03-01","k2"));return[a==b&&!!m&&m.startsWith("409"),"same key → same sub; new key → 409"]});
+ t("IMPROVEMENT 2b default-deny RBAC on reads",()=>{const[e,c]=mk(),m1=throws(()=>e.customers("event_ingestor")),m2=throws(()=>e.hist("event_ingestor",c));return[!!m1&&!!m2,"event_ingestor blocked from customer/invoice reads (403)"]});
+ $("tr").innerHTML=out.join("\n")}
+
+const names=["Setup","Subscribe / Upgrade","Usage events","Invoices","Killer tests"];
+$("tabs").innerHTML=names.map((n,i)=>`<button class="t" onclick="show(${i})">${n}</button>`).join("");
+function show(k){document.querySelectorAll(".tab").forEach((d,i)=>d.style.display=i==k?"":"none");[...$("tabs").children].forEach((b,i)=>b.classList.toggle("on",i==k))}
+newId();show(0);refresh();log("Ready. Add a customer and a plan in Setup, or open Killer tests and press Run.");
+</script></body></html>
